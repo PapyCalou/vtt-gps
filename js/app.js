@@ -165,16 +165,21 @@ function download(blob, name) {
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name;
   document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 }
-const gpxFile = t => new File([buildGpx(t)], slug(t.name) + '.gpx', { type: 'application/gpx+xml' });
+const gpxFile = (t, type = 'application/gpx+xml') => new File([buildGpx(t)], slug(t.name) + '.gpx', { type });
 
+// Safari refuse certains types de fichier dans la feuille de partage : on essaie plusieurs déclarations
+// du même fichier .gpx (iOS choisit les applications proposées d'après l'extension du nom).
 async function shareTrack(t) {
-  const file = gpxFile(t);
-  if (navigator.canShare && navigator.canShare({ files: [file] })) {
-    try { await navigator.share({ files: [file], title: t.name }); return; }
-    catch (e) { if (e.name === 'AbortError') return; }
+  if (navigator.canShare) {
+    for (const type of ['application/gpx+xml', 'application/xml', 'text/xml', 'application/octet-stream', 'text/plain']) {
+      const file = gpxFile(t, type);
+      if (!navigator.canShare({ files: [file] })) continue;
+      try { await navigator.share({ files: [file] }); return; }
+      catch (e) { if (e.name === 'AbortError') return; break; }
+    }
   }
-  download(file, file.name);
-  toast('Fichier GPX téléchargé. Ouvrez-le avec Garmin Connect pour l\'envoyer à votre appareil.');
+  const file = gpxFile(t); download(file, file.name);
+  toast('Partage direct indisponible ici : le fichier GPX a été téléchargé.');
 }
 
 function backup() {
