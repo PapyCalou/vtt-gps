@@ -1,5 +1,5 @@
 // Service worker : l'application s'ouvre même sans réseau (les fonds de carte, eux, demandent une connexion).
-const CACHE = 'vtt-gps-v1';
+const CACHE = 'vtt-gps-v2';
 const SHELL = ['./', 'index.html', 'app.css', 'manifest.webmanifest',
   'js/app.js', 'js/geo.js', 'js/gpx.js', 'js/db.js', 'js/sync.js',
   'vendor/leaflet/leaflet.js', 'vendor/leaflet/leaflet.css',

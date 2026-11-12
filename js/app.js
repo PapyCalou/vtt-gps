@@ -15,7 +15,8 @@ const S = {
   settings: { defaults: {}, gh: { owner: '', repo: '', token: '' }, tombs: {}, bikesAt: 0, lastSync: null, base: 'Topographique' },
   tab: 'sorties', sel: null, editBike: null, pos: null, syncMsg: '',
   f: { type: '', sector: '', km: '', dp: '', dur: '', diff: '', sort: 'date' },
-  idea: { type: '', mode: 'dur', dur: 2, km: 30, dp: '', near: false, radius: 30 }, ideaRes: null,
+  idea: { type: '', mode: 'dur', dur: 2, km: 30, dp: '', near: false, radius: 30, start: 'pos' }, ideaRes: null,
+  loops: null, loopSel: 0, loopMsg: '',
 };
 
 /* ---------- Valeurs dérivées ---------- */
@@ -72,6 +73,7 @@ function toast(msg) {
 /* ---------- Carte ---------- */
 
 let map, trackLayer, posMarker, hoverMarker;
+const LOOP_COLORS = ['#7b2cbf', '#0077b6', '#c2185b'];
 function initMap() {
   map = L.map('map', { zoomControl: false, renderer: L.canvas({ tolerance: 10 }) }).setView([46.6, 2.4], 6);
   L.control.zoom({ position: 'bottomright' }).addTo(map);
@@ -101,6 +103,14 @@ function drawTracks(fit) {
     trackLayer.addLayer(line);
     trackLayer.addLayer(L.circleMarker([t.pts[0][0], t.pts[0][1]], { radius: isSel ? 7 : 5, color: '#fff', weight: 2, fillColor: color, fillOpacity: 1, interactive: false }));
     if (isSel) selLine = line;
+  }
+  if (!S.sel && S.tab === 'idees' && S.loops) {
+    S.loops.forEach((lp, i) => {
+      const on = i === S.loopSel;
+      const line = L.polyline(lp.pts.map(p => [p[0], p[1]]), { color: LOOP_COLORS[i], weight: on ? 6 : 4, opacity: on ? 1 : 0.6, dashArray: on ? null : '8 8' });
+      line.on('click', () => { S.loopSel = i; render(); }); trackLayer.addLayer(line); if (on) line.bringToFront();
+    });
+    if (fit && S.loops.length) { map.fitBounds(L.latLngBounds(S.loops.flatMap(lp => lp.pts.map(p => [p[0], p[1]]))), { padding: [30, 30] }); return; }
   }
   if (selLine) { selLine.bringToFront(); if (fit) map.fitBounds(selLine.getBounds(), { padding: [30, 30] }); }
   else if (fit && list.length) map.fitBounds(L.latLngBounds(list.flatMap(t => t.pts.map(p => [p[0], p[1]]))), { padding: [30, 30] });
@@ -183,7 +193,7 @@ async function shareTrack(t) {
 }
 
 function backup() {
-  const s = { ...S.settings, gh: { ...S.settings.gh, token: '' } };
+  const s = { ...S.settings, gh: { ...S.settings.gh, token: '' }, orsKey: '' };
   download(new Blob([JSON.stringify({ app: 'vtt-gps', v: 1, date: new Date().toISOString(), tracks: S.tracks, bikes: S.bikes, settings: s })], { type: 'application/json' }),
     `vtt-gps-sauvegarde-${new Date().toISOString().slice(0, 10)}.json`);
 }
@@ -341,7 +351,7 @@ function viewIdeas() {
     <p style="margin-top:12px"><button class="btn primary block" data-act="idea">Chercher</button></p>
   </div>
   ${res ? (res.length ? `<h2>Les plus proches de votre demande</h2><ul class="cards">${res.map(r => cardHtml(r.t, `<span class="tag">${r.why}</span>`)).join('')}</ul>` : `<div class="empty"><p class="muted">Aucune sortie ne convient. Élargissez la pratique ou le rayon.</p></div>`) : ''}
-  <p class="muted small" style="margin-top:16px">À venir : la création de nouvelles boucles depuis votre position, sur les chemins et sentiers.</p>`;
+  ${loopsHtml()}`;
 }
 
 function findIdeas() {
@@ -355,6 +365,79 @@ function findIdeas() {
     return { t, s: Math.abs(gk) / +i.km + (i.dp ? Math.abs(gd) / +i.dp : 0), why: `${gk >= 0 ? '+' : '−'} ${fr(Math.abs(gk), 1)} km${i.dp ? `, ${gd >= 0 ? '+' : '−'} ${fr(Math.abs(gd))} m` : ''}` };
   }).sort((a, b) => a.s - b.s).slice(0, 5);
   render();
+}
+
+// Vitesse moyenne personnelle (km/h) pour une pratique, d'après les sorties enregistrées.
+function speed(type) {
+  const ts = S.tracks.filter(t => t.type === type && t.stats.mov);
+  const km = ts.reduce((s, t) => s + t.stats.km, 0), h = ts.reduce((s, t) => s + t.stats.mov, 0) / 3600;
+  return h > 0 ? km / h : TYPES[type].flat * 0.75;
+}
+
+const ORS_PROFILE = { vtt: 'cycling-mountain', gravel: 'cycling-regular', route: 'cycling-road', rando: 'foot-hiking' };
+
+// Demande plusieurs boucles au service openrouteservice et garde les trois plus proches de la demande.
+async function genLoops() {
+  const i = S.idea, key = S.settings.orsKey, type = i.type || 'vtt';
+  const fail = msg => { S.loopMsg = msg; S.loops = null; render(); };
+  if (!key) return fail('Ajoutez d\'abord votre clé openrouteservice dans les Réglages.');
+  let start;
+  if (i.start === 'pos') { if (!S.pos) { locate(); return fail('Localisation en cours. Relancez la recherche dans quelques secondes.'); } start = S.pos; }
+  else if (i.start === 'map') { const c = map.getCenter(); start = [c.lat, c.lng]; }
+  else { const t = S.tracks.find(x => x.id === i.start); if (!t) return fail('Choisissez un point de départ.'); start = [t.pts[0][0], t.pts[0][1]]; }
+  const km = i.mode === 'dur' ? +i.dur * speed(type) : +i.km;
+  if (!(km >= 2 && km <= 100)) return fail('La distance doit être comprise entre 2 et 100 km.');
+  S.loopMsg = `Calcul de boucles d'environ ${fr(km)} km…`; S.loops = null; render();
+  const ask = async n => {
+    const r = await fetch(`https://api.openrouteservice.org/v2/directions/${ORS_PROFILE[type]}/geojson`, {
+      method: 'POST', headers: { Authorization: key, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ coordinates: [[start[1], start[0]]], elevation: true, instructions: false,
+        options: { round_trip: { length: Math.round(km * 1000), points: 3 + n % 3, seed: Math.floor(Math.random() * 100000) } } }),
+    });
+    if (!r.ok) { const e = new Error('ors'); e.status = r.status; try { e.detail = (await r.json()).error?.message; } catch (_) {} throw e; }
+    const coords = (await r.json()).features[0].geometry.coordinates;
+    return { type, ...analyse(coords.map(c => ({ lat: c[1], lon: c[0], ele: c[2] ?? null, t: null }))) };
+  };
+  const res = await Promise.allSettled([0, 1, 2, 3, 4].map(ask));
+  const ok = res.filter(r => r.status === 'fulfilled').map(r => r.value);
+  if (!ok.length) {
+    const e = res[0].reason || {};
+    return fail(e.status === 401 || e.status === 403 ? 'Clé openrouteservice refusée. Vérifiez-la dans les Réglages.'
+      : e.status === 429 ? 'Quota openrouteservice atteint. Réessayez dans une minute.'
+      : e.detail ? 'Le service n\'a pas trouvé de boucle : ' + e.detail
+      : 'Le service de calcul est injoignable. Vérifiez votre connexion.');
+  }
+  const score = l => Math.abs(l.stats.km - km) / km + (i.dp ? Math.abs((l.stats.dplus || 0) - +i.dp) / +i.dp : 0);
+  const kept = [];
+  for (const l of ok.sort((a, b) => score(a) - score(b)))
+    if (!kept.some(k => Math.abs(k.stats.km - l.stats.km) < 0.3 && Math.abs((k.stats.dplus || 0) - (l.stats.dplus || 0)) < 15)) kept.push(l);
+  S.loops = kept.slice(0, 3); S.loopSel = 0; S.loopMsg = ''; render(true);
+}
+
+async function saveLoop(n) {
+  const l = S.loops[n];
+  const t = { id: uid(), name: `Boucle ${TYPES[l.type].label} ${fr(l.stats.km)} km`, type: l.type, typeSure: true, date: null, pts: l.pts, stats: l.stats,
+    sector: 'À classer', startLabel: '', bikeId: TYPES[l.type].bike ? (S.settings.defaults[l.type] || null) : null, status: 'afaire', diff: null, notes: '', createdAt: Date.now() };
+  S.tracks.push(t); await saveTrack(t); S.loops = null; toast('Boucle enregistrée dans vos sorties, à faire.'); openTrack(t.id); locateSectors([t]);
+}
+
+function loopsHtml() {
+  const i = S.idea, type = i.type || 'vtt';
+  const starts = [['pos', 'Ma position actuelle'], ['map', 'Le centre de la carte'], ...S.tracks.map(t => [t.id, 'Départ de « ' + t.name + ' »'])];
+  return `<h2>Créer une nouvelle boucle</h2>
+  <div class="box">
+    <p class="muted small">Avec les mêmes critères, l'application trace jusqu'à trois boucles inédites sur les chemins adaptés à la pratique (${TYPES[type].label}${i.type ? '' : ', par défaut'}).</p>
+    <div class="field"><label for="i-start">Point de départ</label>${sel('data-i="start"', i.start, starts, 'i-start')}</div>
+    <button class="btn primary block" data-act="loops">Proposer des boucles</button>
+    ${S.loopMsg ? `<p class="small" style="margin-top:8px">${esc(S.loopMsg)}</p>` : ''}
+  </div>
+  ${S.loops ? `<ul class="cards">${S.loops.map((l, n) => `<li><div class="card" style="--tc:${LOOP_COLORS[n]}">
+      <span class="ttl">Boucle ${n + 1}</span>
+      <span class="nums"><span><b>${fr(l.stats.km, 1)}</b> km</span><span><b>${fr(l.stats.dplus)}</b> m D+</span><span><b>${fmtDur(estimate(l.type, l.stats.km, l.stats.dplus, factor(l.type)))}</b></span></span>
+      <span class="foot"><span class="pill" style="--lc:${LEVELS[difficulty(l.type, l.stats.km, l.stats.dplus)].color}">${LEVELS[difficulty(l.type, l.stats.km, l.stats.dplus)].label}</span>
+        <button class="btn" data-act="showloop" data-n="${n}">${n === S.loopSel ? 'Affichée sur la carte' : 'Voir sur la carte'}</button>
+        <button class="btn primary" data-act="saveloop" data-n="${n}">Enregistrer</button></span></div></li>`).join('')}</ul>
+    <p class="muted small" style="margin-top:8px">Tracés calculés automatiquement à partir d'OpenStreetMap : vérifiez sur la carte avant de partir, certains chemins peuvent être privés ou impraticables.</p>` : ''}`;
 }
 
 const BIKE_FIELDS = [['brand', 'Marque'], ['model', 'Modèle'], ['year', 'Année'], ['frame', 'Taille du cadre'], ['wheels', 'Roues'], ['tyres', 'Pneus (modèle, section)'],
@@ -414,12 +497,15 @@ function viewSettings() {
     <button class="btn primary" data-act="sync">Synchroniser maintenant</button>
     <p class="small" style="margin-top:8px">${esc(S.syncMsg || (S.settings.lastSync ? 'Dernière synchronisation : ' + new Date(S.settings.lastSync).toLocaleString('fr-FR') : 'Pas encore synchronisé.'))}</p>
   </div>
+  <h2>Création de boucles</h2>
+  <div class="box"><p class="muted small">Le calcul des nouvelles boucles utilise le service gratuit openrouteservice. Créez un compte sur <a href="https://openrouteservice.org/dev/#/signup" target="_blank" rel="noopener">openrouteservice.org</a>, puis collez ici votre clé.</p>
+    <div class="field"><label for="s-ors">Clé openrouteservice (elle reste sur cet appareil)</label><input type="password" id="s-ors" data-s="orsKey" value="${esc(S.settings.orsKey || '')}" autocomplete="off"></div></div>
   <h2>Sauvegarde</h2>
   <div class="box"><p class="muted small">Un seul fichier contient toutes vos sorties et vos vélos. Rangez-le dans OneDrive, par exemple.</p>
     <div class="row"><button class="btn" data-act="backup">Tout sauvegarder</button><button class="btn" data-act="restore">Restaurer une sauvegarde</button></div></div>
   <h2>Installer sur l'iPhone</h2>
   <div class="box"><p class="muted small">Dans Safari, touchez le bouton Partager puis « Sur l'écran d'accueil ». L'application s'ouvre ensuite comme une application classique.</p></div>
-  <p class="muted small">VTT-GPS version 1 · ${S.tracks.length} sortie${S.tracks.length > 1 ? 's' : ''} sur cet appareil. Le point de départ de chaque sortie importée est envoyé au service de géocodage d'OpenStreetMap pour trouver sa commune.</p>`;
+  <p class="muted small">VTT-GPS version 2 · ${S.tracks.length} sortie${S.tracks.length > 1 ? 's' : ''} sur cet appareil. Le point de départ de chaque sortie importée est envoyé au service de géocodage d'OpenStreetMap pour trouver sa commune.</p>`;
 }
 
 function render(fit) {
@@ -453,6 +539,9 @@ const ACTIONS = {
     await db.delTrack(t.id); await saveSettings(); scheduleSync(); S.sel = null; render(true);
   },
   idea: findIdeas,
+  loops: genLoops,
+  showloop: el => { S.loopSel = +el.dataset.n; if (innerWidth < 900) S.tab = 'carte'; render(true); },
+  saveloop: el => saveLoop(+el.dataset.n),
   newbike: () => { S.editBike = 'new'; render(); },
   editbike: el => { S.editBike = el.dataset.id; render(); },
   closebike: () => { S.editBike = null; render(); },
@@ -504,7 +593,8 @@ document.addEventListener('change', async e => {
   if (el.id === 'file') { const files = [...el.files]; el.value = ''; return importFiles(files); }
   if (el.id === 'restore') { const f = el.files[0]; el.value = ''; return f && restore(f); }
   if (d.f) { S.f[d.f] = el.value; return render(true); }
-  if (d.i) { S.idea[d.i] = el.type === 'checkbox' ? el.checked : el.value; if (d.i === 'mode' ) render(); return; }
+  if (d.i) { S.idea[d.i] = el.type === 'checkbox' ? el.checked : el.value; if (d.i === 'mode' || d.i === 'type') render(); return; }
+  if (d.s) { S.settings[d.s] = el.value.trim(); return saveSettings(); }
   if (d.g) { S.settings.gh[d.g] = el.value.trim(); return saveSettings(); }
   if (d.def) { if (el.value) S.settings.defaults[d.def] = el.value; else delete S.settings.defaults[d.def]; return saveBikes(); }
   if (d.d) {
